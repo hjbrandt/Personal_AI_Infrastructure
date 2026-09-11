@@ -326,6 +326,8 @@ A confident "nothing to save" is correct.`;
 export interface CurrentMemorySnapshot {
   principal: string[];
   assistant: string[];
+  /** Fingerprint of each list as read; absent when the file could not be read. */
+  fingerprints?: { principal?: string; assistant?: string };
 }
 
 const PRINCIPAL_MEMORY_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/USER/PRINCIPAL/PRINCIPAL_MEMORY.md");
@@ -333,11 +335,16 @@ const DA_MEMORY_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/USER/DIGITAL_ASSISTANT/D
 
 /** Read both hot-layer files' current entries so the reviewer curates against reality. */
 export function readCurrentMemorySnapshot(): CurrentMemorySnapshot {
-  const readEntries = (path: string): string[] => {
-    const r = memoryWriterRead(path);
-    return "code" in r ? [] : r.entries;
+  const principal = memoryWriterRead(PRINCIPAL_MEMORY_PATH);
+  const assistant = memoryWriterRead(DA_MEMORY_PATH);
+  return {
+    principal: "code" in principal ? [] : principal.entries,
+    assistant: "code" in assistant ? [] : assistant.entries,
+    fingerprints: {
+      principal: "code" in principal ? undefined : principal.fingerprint,
+      assistant: "code" in assistant ? undefined : assistant.fingerprint,
+    },
   };
-  return { principal: readEntries(PRINCIPAL_MEMORY_PATH), assistant: readEntries(DA_MEMORY_PATH) };
 }
 
 function renderCurrentMemory(snap: CurrentMemorySnapshot | undefined): string[] {
@@ -493,10 +500,13 @@ export interface DispatchSummary {
 
 /** A deliberate MemoryWriter safety refusal (net-drop erosion block), not a pipeline fault. */
 function isGuardRefusal(result: AddResult): boolean {
-  return !result.ok && /ESUSPECT_EROSION/.test((result as { message?: string }).message ?? "");
+  return !result.ok && /ESUSPECT_EROSION|ESTALE_BASE/.test((result as { message?: string }).message ?? "");
 }
 
-export function dispatchItems(items: TypedItem[], opts: { dryRun?: boolean; confidenceThreshold?: number } = {}): { summary: DispatchSummary; results: AddResult[] } {
+export function dispatchItems(
+  items: TypedItem[],
+  opts: { dryRun?: boolean; confidenceThreshold?: number; baseFingerprints?: CurrentMemorySnapshot["fingerprints"] } = {},
+): { summary: DispatchSummary; results: AddResult[] } {
   const summary: DispatchSummary = {
     total: items.length,
     by_type: {},
@@ -510,6 +520,7 @@ export function dispatchItems(items: TypedItem[], opts: { dryRun?: boolean; conf
   };
   const results: AddResult[] = [];
   const threshold = opts.confidenceThreshold ?? loadConfidenceThreshold();
+  const bases: NonNullable<CurrentMemorySnapshot["fingerprints"]> = { ...opts.baseFingerprints };
 
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
@@ -521,8 +532,15 @@ export function dispatchItems(items: TypedItem[], opts: { dryRun?: boolean; conf
       continue;
     }
 
-    const result = memoryAdd(item);
+    // Memory sets replace the whole file with a list computed from the snapshot
+    // taken before inference; the fingerprint makes the write refuse if the file
+    // changed in the meantime. It comes from our own read, never from the model.
+    const result = memoryAdd(item, item.type === "memory" ? { expectedFingerprint: bases[item.actor] } : {});
     results.push(result);
+    // A second item for the same actor builds on this write, not the old snapshot.
+    if (item.type === "memory" && result.ok && typeof result.detail?.fingerprint === "string") {
+      bases[item.actor] = result.detail.fingerprint;
+    }
     if (result.ok) {
       summary.succeeded++;
 
@@ -575,7 +593,8 @@ export function dispatchItems(items: TypedItem[], opts: { dryRun?: boolean; conf
       }
     } else if (isGuardRefusal(result)) {
       // A safety-guard refusal (ESUSPECT_EROSION — the MemoryWriter blocking a net-drop
-      // consolidation) is the guard working, not a pipeline failure. Counting it as `failed`
+      // consolidation; ESTALE_BASE — the file changed during inference, so a newer edit
+      // won; MemoryHealthCheck reports those separately) is the guard working, not a pipeline failure. Counting it as `failed`
       // flips the run ok=false and trips the memory-health CRITICAL alert on a correct refusal
       // (same class as the empty-transcript→skipped precedent). Surface it as a skip: the fuller
       // memory set the guard preserved is intact, and retrying with allowDrastic is a human call.
@@ -731,7 +750,7 @@ export async function review(opts: ReviewOptions = {}): Promise<ReviewResult> {
   writeRunDebug(runId, { "response.parsed.json": JSON.stringify(parsed.output, null, 2) });
 
   // 6. Dispatch
-  const { summary, results } = dispatchItems(parsed.output.items, { dryRun: opts.dryRun });
+  const { summary, results } = dispatchItems(parsed.output.items, { dryRun: opts.dryRun, baseFingerprints: snapshot.fingerprints });
   writeRunDebug(runId, {
     "dispatch.log": [
       `Items: ${summary.total} (succeeded=${summary.succeeded} failed=${summary.failed} skipped_guard=${summary.skipped_guard})`,

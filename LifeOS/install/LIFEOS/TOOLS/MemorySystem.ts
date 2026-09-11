@@ -403,7 +403,7 @@ function generateProposalId(): string {
  * subprocess) is responsible for trimming. add() surfaces the at-cap error
  * verbatim so the caller can re-submit with explicit eviction choices.
  */
-function addMemoryItem(item: TypedItem & { type: "memory" }, path: string): AddResult {
+function addMemoryItem(item: TypedItem & { type: "memory" }, path: string, opts: AddOptions): AddResult {
   const current = memoryWriterRead(path);
   if ("code" in current) {
     return { ok: false, code: "EINVAL_ITEM", message: `Memory file unreadable: ${current.message}` };
@@ -431,7 +431,11 @@ function addMemoryItem(item: TypedItem & { type: "memory" }, path: string): AddR
     newEntries = [...current.entries, item.content.trim()];
   }
 
-  const writeResult = memoryWriterSetEntries(path, newEntries, { updatedBy: "MemorySystem.add" });
+  // Write only if the file still holds what the list was computed from: the
+  // caller's read for op:"set" (the reviewer's snapshot, minutes old), this
+  // function's own read for op:"add".
+  const expectedFingerprint = item.op === "set" ? opts.expectedFingerprint : current.fingerprint;
+  const writeResult = memoryWriterSetEntries(path, newEntries, { updatedBy: "MemorySystem.add", expectedFingerprint });
   if (!writeResult.ok) {
     return {
       ok: false,
@@ -451,6 +455,7 @@ function addMemoryItem(item: TypedItem & { type: "memory" }, path: string): AddR
       dropped_malformed: writeResult.dropped_malformed,
       dropped_overlength: writeResult.dropped_overlength,
       dropped_duplicates: writeResult.dropped_duplicates,
+      fingerprint: writeResult.fingerprint,
     },
   };
 }
@@ -807,7 +812,16 @@ export function sanitizeTypedItemForPersistence(item: TypedItem): SanitizedItemR
  * item's resolved storage path's mutation tier matches the type's declared
  * tier — a defense-in-depth check against registry/classifier drift.
  */
-export function add(item: TypedItem): AddResult {
+/**
+ * Orchestrator-side write context — deliberately NOT part of the item, whose
+ * shape is model-facing (the sanitizer rejects unknown item fields).
+ */
+export interface AddOptions {
+  /** For memory op:"set": fingerprint of the entries the list was computed from (MemoryWriter.read().fingerprint). */
+  expectedFingerprint?: string;
+}
+
+export function add(item: TypedItem, opts: AddOptions = {}): AddResult {
   if (!item || typeof item !== "object" || !("type" in item)) {
     return { ok: false, code: "EINVAL_ITEM", message: "Item missing 'type' field" };
   }
@@ -863,7 +877,7 @@ export function add(item: TypedItem): AddResult {
 
   switch (entry.write_mode) {
     case "set-overwrite":
-      return addMemoryItem(item as TypedItem & { type: "memory" }, path);
+      return addMemoryItem(item as TypedItem & { type: "memory" }, path, opts);
     case "append":
       return addNoteTypeItem(item as TypedItem & { type: "idea" | "knowledge" }, path);
     case "queue": {

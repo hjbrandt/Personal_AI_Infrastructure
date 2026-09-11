@@ -345,6 +345,35 @@ if (existsSync(REVIEWER_RUNS)) {
   } catch { /* non-fatal */ }
 }
 
+// CHECK 10: refused writes — a write dropped because the file changed after its
+// base was read (ESTALE_BASE) or the lock never cleared (ELOCK_HELD). The
+// reviewer's stdio is ignored, so this log is the only place a refusal shows up.
+// Warns for 24h, then clears on its own; a steady stream means the reviewer keeps
+// losing races and its read→write window needs redesign.
+{
+  const WRITES_FILE = join(OBS_DIR, "memory-writes.jsonl");
+  const nowMs = process.env.CORTEX_HEALTH_NOW ? Date.parse(process.env.CORTEX_HEALTH_NOW) : Date.now();
+  try {
+    // Whole file, filtered by time: a row count would let a busy day push a
+    // refusal out early. A future timestamp (clock skew) is not counted.
+    const refused = existsSync(WRITES_FILE)
+      ? readFileSync(WRITES_FILE, "utf-8").trim().split("\n")
+          .map(l => { try { return JSON.parse(l); } catch { return null; } })
+          .filter((r: any) => {
+            if (r?.rejected !== true || (r.rejection_code !== "ESTALE_BASE" && r.rejection_code !== "ELOCK_HELD")) return false;
+            const age = nowMs - Date.parse(r.ts);
+            return age >= 0 && age < 24 * 60 * 60 * 1000;
+          })
+      : [];
+    if (refused.length > 0) {
+      add("refused-writes", "warn", `${refused.length} memory write${refused.length === 1 ? "" : "s"} refused in 24h (stale or locked)`,
+          { rows: refused.map((r: any) => ({ ts: r.ts, file: r.file, code: r.rejection_code, by: r.updated_by })) });
+    } else {
+      add("refused-writes-none", "ok", "No memory writes refused in the last 24h.");
+    }
+  } catch { /* non-fatal */ }
+}
+
 // F5: evidence-driven Cortex health. Paths and clock are injectable so tests never touch live state.
 function cortexThresholdEnv(name: string): number | undefined {
   const raw = process.env[name]; if (raw === undefined || raw === "") return undefined;

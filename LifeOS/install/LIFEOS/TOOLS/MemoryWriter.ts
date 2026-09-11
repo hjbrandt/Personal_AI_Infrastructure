@@ -14,7 +14,8 @@
  *   5. Writes atomically: acquire <file>.lock → write <file>.tmp → atomic rename
  *
  * Why set-overwrite beats incremental add/replace/remove:
- *   - No race surface (single atomic write per review)
+ *   - One atomic write per review (the list is computed from a read made minutes
+ *     earlier, so callers pass expectedFingerprint to refuse a stale base)
  *   - Idempotent (same input produces same file)
  *   - Eviction is structural (model omits entries it wants gone)
  *   - Simpler mental model: "here is the state I want"
@@ -49,6 +50,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, resolve as pathResolve } from "node:path";
 import { homedir } from "node:os";
 
@@ -85,6 +87,8 @@ export interface SetEntriesOk {
   new_count: number;
   evictions: string[];
   additions: string[];
+  /** Fingerprint of the entries just written — the base for a follow-up write. */
+  fingerprint: string;
 }
 
 export interface SetEntriesErrAtCap {
@@ -130,8 +134,21 @@ export interface SetEntriesErrErosion {
   new_count: number;
 }
 
+/**
+ * The caller's view of the file is stale: its entries changed after the caller
+ * read them (see SetEntriesOptions.expectedFingerprint). Nothing was written.
+ */
+export interface SetEntriesErrStale {
+  ok: false;
+  code: "ESTALE_BASE";
+  message: string;
+  expected_fingerprint: string;
+  actual_fingerprint: string;
+}
+
 export type SetEntriesResult =
   | SetEntriesOk
+  | SetEntriesErrStale
   | SetEntriesErrAtCap
   | SetEntriesErrPath
   | SetEntriesErrLock
@@ -151,6 +168,8 @@ export interface ReadResult {
    * `entries`, so anything listed here is erased by its next write.
    */
   dropped_invalid: { entry: string; reason: "malformed" | "overlength" }[];
+  /** entriesFingerprint(entries) — pass back as expectedFingerprint to write only if nothing changed since. */
+  fingerprint: string;
 }
 
 // ── Path validation ──
@@ -233,6 +252,15 @@ function validateAndDedup(entries: string[]): ValidationOutcome {
   }
 
   return { accepted, malformed, overlength, duplicates };
+}
+
+/**
+ * Fingerprint of an entry list: what a caller saw when it read the file. Entries
+ * only, never the raw bytes — frontmatter (last_updated) changes on every write,
+ * and a timestamp-only difference must not count as a changed file.
+ */
+export function entriesFingerprint(entries: string[]): string {
+  return createHash("sha256").update(entries.join("\n")).digest("hex");
 }
 
 // ── File parse / serialize ──
@@ -350,24 +378,40 @@ export function serializeMemoryContent(
 
 // ── Atomic write with lock ──
 
+// A write holds the lock for milliseconds, so a held lock is usually about to be
+// released. Wait briefly rather than drop a write that may carry minutes of
+// reviewer inference.
+const LOCK_WAIT_MS = 2000;
+const LOCK_POLL_MS = 50;
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 function withLock<T>(filePath: string, action: () => T): T | SetEntriesErrLock | SetEntriesErrIO {
   const lockPath = `${filePath}.lock`;
   let fd: number | null = null;
-  try {
-    fd = openSync(lockPath, "wx"); // O_CREAT | O_EXCL
-  } catch (e: any) {
-    if (e?.code === "EEXIST") {
-      return {
-        ok: false,
-        code: "ELOCK_HELD",
-        message: `Lock held by another writer: ${lockPath}. Investigate stale lock if persistent.`,
-      };
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  while (fd === null) {
+    try {
+      fd = openSync(lockPath, "wx"); // O_CREAT | O_EXCL
+    } catch (e: any) {
+      if (e?.code !== "EEXIST") {
+        return {
+          ok: false,
+          code: "EWRITE_FAILED",
+          message: `Failed to acquire lock: ${e?.message || String(e)}`,
+        };
+      }
+      if (Date.now() >= deadline) {
+        return {
+          ok: false,
+          code: "ELOCK_HELD",
+          message: `Lock held by another writer for ${LOCK_WAIT_MS}ms: ${lockPath}. Investigate stale lock if persistent.`,
+        };
+      }
+      sleepSync(LOCK_POLL_MS);
     }
-    return {
-      ok: false,
-      code: "EWRITE_FAILED",
-      message: `Failed to acquire lock: ${e?.message || String(e)}`,
-    };
   }
 
   try {
@@ -494,9 +538,10 @@ function logWriteEvent(
  */
 function logRejectedWrite(
   filePath: string,
-  rejection: { code: string; message: string; prior_count: number; new_count: number },
+  rejection: { code: string; message: string; prior_count?: number; new_count?: number },
   delta: { evictions: string[]; additions: string[] },
   updatedBy?: string,
+  extra: Record<string, unknown> = {},
 ): void {
   appendWriteLog({
     ts: new Date().toISOString(),
@@ -509,6 +554,7 @@ function logRejectedWrite(
     new_count: rejection.new_count,
     evictions: delta.evictions,
     additions: delta.additions,
+    ...extra,
   });
 }
 
@@ -519,6 +565,13 @@ export interface SetEntriesOptions {
   updatedBy?: string;
   /** Bypass the catastrophic-shrink guard (legitimate full-clear / restore). */
   allowDrastic?: boolean;
+  /**
+   * The `fingerprint` from the read this write was computed from. When given,
+   * the write is refused with ESTALE_BASE if the file's entries changed since —
+   * a set-overwrite built on an old read would otherwise silently undo every
+   * write in between (the reviewer's read→inference→write window is minutes).
+   */
+  expectedFingerprint?: string;
 }
 
 export function setEntries(
@@ -565,6 +618,33 @@ export function setEntries(
     const priorSet = new Set(priorEntries);
     const evictions = priorEntries.filter((e) => !newSet.has(e));
     const additions = newEntries.filter((e) => !priorSet.has(e));
+
+    // Stale-base guard, computed IN-LOCK: no lock-respecting writer can land
+    // between this check and the write (direct file writes bypass the lock).
+    // Compared against the same valid-entries view read() returns.
+    if (options.expectedFingerprint !== undefined) {
+      const actual = entriesFingerprint(validateAndDedup(priorEntries).accepted);
+      if (actual !== options.expectedFingerprint) {
+        const staleErr: SetEntriesErrStale = {
+          ok: false,
+          code: "ESTALE_BASE",
+          message: "Refused: the file's entries changed after this write's base was read. Nothing was written; re-read and recompute.",
+          expected_fingerprint: options.expectedFingerprint,
+          actual_fingerprint: actual,
+        };
+        logRejectedWrite(
+          abs,
+          { code: staleErr.code, message: staleErr.message, prior_count: priorEntries.length, new_count: newEntries.length },
+          // Not { evictions, additions }: measured against the CURRENT file they
+          // would list the newer edit's changes as the review's, and replaying them
+          // would undo that edit. The review's own intent is in its run-debug folder.
+          { evictions: [], additions: [] },
+          options.updatedBy,
+          { expected_fingerprint: staleErr.expected_fingerprint, actual_fingerprint: actual },
+        );
+        return staleErr;
+      }
+    }
 
     // Catastrophic-shrink guard (computed IN-LOCK against the just-read prior
     // state, so it can't race a concurrent write). set-overwrite REPLACES the
@@ -629,11 +709,17 @@ export function setEntries(
       new_count: newEntries.length,
       evictions,
       additions,
+      fingerprint: entriesFingerprint(newEntries),
     };
     logWriteEvent(abs, ok, options.updatedBy);
     return ok;
   });
 
+  // A lock that never cleared dropped this write; log it, since the reviewer's
+  // stdio is ignored and a returned error alone is never seen.
+  if (!result.ok && result.code === "ELOCK_HELD") {
+    logRejectedWrite(abs, result, { evictions: [], additions: [] }, options.updatedBy);
+  }
   return result;
 }
 
@@ -651,6 +737,7 @@ export function read(filePath: string): ReadResult | SetEntriesErrPath {
       cap_entries: MAX_ENTRIES,
       cap_chars: MAX_ENTRIES * MAX_CHARS_PER_ENTRY,
       dropped_invalid: [],
+      fingerprint: entriesFingerprint([]),
     };
   }
 
@@ -678,6 +765,7 @@ export function read(filePath: string): ReadResult | SetEntriesErrPath {
     cap_entries: MAX_ENTRIES,
     cap_chars: MAX_ENTRIES * MAX_CHARS_PER_ENTRY,
     dropped_invalid,
+    fingerprint: entriesFingerprint(valid.accepted),
   };
 }
 
